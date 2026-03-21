@@ -140,7 +140,7 @@ fn main() {
             let dpi = ((hi as u16) << 8) | lo as u16;
 
             if dpi_write(&device, dpi) {
-                println!("written: {:?} → DPI {:#06x} ✓", data, dpi);
+                println!("written: {:?} →  DPI {:#06x}", data, dpi);
             } else {
                 eprintln!("write failed");
                 std::process::exit(1);
