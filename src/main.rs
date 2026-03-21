@@ -8,14 +8,13 @@ const RECEIVER_PID: u16 = 0xc52b;
 // Device index 0x01 = first paired device on the receiver (the mouse)
 const DEVICE_IDX: u8 = 0x01;
 
-// HID++ feature index for AdjustableDPI on this specific mouse.
-// Feature indices are not fixed across devices. This was discovered by
-// enumerating the feature table via IFeatureSet (feature 0x0001).
-const FEAT_DPI: u8 = 0x12;
+// HID++ feature IDs are stable across all Logitech devices.
+// Unlike feature indices, these never change between models.
+const FEAT_ID_ADJUSTABLE_DPI: u16 = 0x2201;
 
 #[derive(Parser)]
 #[command(name = "mouse-fs")]
-#[command(about = "Store 2 bytes of data in your Logitech MX Vertical's DPI register")]
+#[command(about = "Store 2 bytes of data in your Logitech mouse's DPI register")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -59,14 +58,14 @@ fn hidpp_short(device: &hidapi::HidDevice, feat: u8, func: u8, p: [u8; 3]) -> Op
 /// Read the current DPI value from the mouse.
 ///
 /// AdjustableDPI function 0x02 = getSensorDPI(sensor_index).
-/// Sensor index 0 is the only sensor on the MX Vertical.
+/// Sensor index 0 is the primary sensor.
 /// The DPI value is a big-endian u16 at bytes [5..6] of the response.
 ///
 /// This doubles as our 2-byte storage primitive: the DPI register accepts
 /// arbitrary u16 values (200-4000+ confirmed, no quantization) and persists them
 /// in the mouse's flash across power cycles and reconnections.
-fn dpi_read(device: &hidapi::HidDevice) -> u16 {
-    hidpp_short(device, FEAT_DPI, 0x02, [0, 0, 0])
+fn dpi_read(device: &hidapi::HidDevice, feat_dpi: u8) -> u16 {
+    hidpp_short(device, feat_dpi, 0x02, [0, 0, 0])
         .map(|r| ((r[5] as u16) << 8) | r[6] as u16)
         .unwrap_or(0)
 }
@@ -77,14 +76,14 @@ fn dpi_read(device: &hidapi::HidDevice) -> u16 {
 /// The mouse often sends no response packet on successful write. It only responds
 /// when there's an error or a value change to report. Rather than treating a missing
 /// response as failure, we verify by reading back.
-fn dpi_write(device: &hidapi::HidDevice, dpi: u16) -> bool {
+fn dpi_write(device: &hidapi::HidDevice, feat_dpi: u8, dpi: u16) -> bool {
     hidpp_short(
         device,
-        FEAT_DPI,
+        feat_dpi,
         0x03,
         [0x00, (dpi >> 8) as u8, (dpi & 0xff) as u8],
     );
-    dpi_read(device) == dpi
+    dpi_read(device, feat_dpi) == dpi
 }
 
 /// Find and open the first Logitech Unifying receiver interface that has the mouse paired.
@@ -96,7 +95,7 @@ fn dpi_write(device: &hidapi::HidDevice, dpi: u16) -> bool {
 ///
 /// macOS assigns DevSrvsID numbers dynamically so we can't rely on a fixed path across sessions.
 /// This probe approach works regardless of enumeration order.
-fn open_device(api: &HidApi) -> hidapi::HidDevice {
+fn open_device(api: &HidApi) -> (hidapi::HidDevice, u8) {
     for info in api
         .device_list()
         .filter(|d| d.vendor_id() == LOGITECH_VID && d.product_id() == RECEIVER_PID)
@@ -114,19 +113,41 @@ fn open_device(api: &HidApi) -> hidapi::HidDevice {
         let mut buf = [0u8; 20];
         if let Ok(n) = dev.read_timeout(&mut buf, 500) {
             if n > 0 && buf[1] == DEVICE_IDX {
-                if dpi_read(&dev) != 0 {
-                    return dev;
+                if let Some(feat_dpi) = find_feature_by_scan(&dev, FEAT_ID_ADJUSTABLE_DPI) {
+                    return (dev, feat_dpi);
                 }
             }
         }
     }
-    panic!("no responsive Logitech receiver found. Is Logi Options+ running?");
+
+    eprintln!("error: no responsive Logitech receiver found.");
+    eprintln!("hint: is Logi Options+ running? Try quitting it.");
+    std::process::exit(1);
+}
+
+/// Scan the full feature table and find the index of a given feature ID.
+/// This is more reliable than IFeatureSet lookup when the device returns
+/// inconsistent results across interfaces.
+fn find_feature_by_scan(device: &hidapi::HidDevice, target_id: u16) -> Option<u8> {
+    // Get feature count from IFeatureSet (index 0x01), fn 0x00
+    let r = hidpp_short(device, 0x01, 0x00, [0x00, 0x00, 0x00])?;
+    let count = r[4];
+
+    for i in 1..=count {
+        // IFeatureSet fn 0x01 = getFeatureId(index) returns feature ID at that index
+        let r = hidpp_short(device, 0x01, 0x01, [i, 0x00, 0x00])?;
+        let feat_id = ((r[4] as u16) << 8) | r[5] as u16;
+        if feat_id == target_id {
+            return Some(i);
+        }
+    }
+    None
 }
 
 fn main() {
     let cli = Cli::parse();
     let api = HidApi::new().expect("Failed to init HID API");
-    let device = open_device(&api);
+    let (device, feat_dpi) = open_device(&api);
 
     match cli.cmd {
         Cmd::Write { data } => {
@@ -139,7 +160,7 @@ fn main() {
             let lo = if bytes.len() > 1 { bytes[1] } else { 0x00 };
             let dpi = ((hi as u16) << 8) | lo as u16;
 
-            if dpi_write(&device, dpi) {
+            if dpi_write(&device, feat_dpi, dpi) {
                 println!("written: {:?} →  DPI {:#06x}", data, dpi);
             } else {
                 eprintln!("write failed");
@@ -148,7 +169,7 @@ fn main() {
         }
 
         Cmd::Read => {
-            let dpi = dpi_read(&device);
+            let dpi = dpi_read(&device, feat_dpi);
             let hi = (dpi >> 8) as u8;
             let lo = (dpi & 0xff) as u8;
             // Show as string if both bytes are printable ASCII, otherwise hex
@@ -162,12 +183,12 @@ fn main() {
         }
 
         Cmd::Reset => {
-            dpi_write(&device, 1000);
+            dpi_write(&device, feat_dpi, 1000);
             println!("reset to 1000 DPI");
         }
 
         Cmd::Raw => {
-            println!("DPI register: {}", dpi_read(&device));
+            println!("DPI register: {}", dpi_read(&device, feat_dpi));
         }
     }
 }
